@@ -1,0 +1,5 @@
+/target
+/res
+/.vscode
+SDL2.dll
+sdl2-config
