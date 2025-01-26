@@ -1,4 +1,4 @@
-use std::ops::Range;
+use wgpu::util::DeviceExt;
 
 use super::texture;
 
@@ -63,72 +63,78 @@ pub struct Model {
     pub materials: Vec<Material>,
 }
 
-pub trait DrawModel<'a> {
-    #[allow(unused)]
-    fn draw_mesh(
-        &mut self,
-        mesh: &'a Mesh,
-        material: &'a Material,
-        camera_bind_group: &'a wgpu::BindGroup,
-    );
-    fn draw_mesh_instanced(
-        &mut self,
-        mesh: &'a Mesh,
-        material: &'a Material,
-        instances: Range<u32>,
-        camera_bind_group: &'a wgpu::BindGroup,
-    );
+pub fn texture_to_model (
+    texture: texture::Texture,
+    layout: &wgpu::BindGroupLayout,
+    device: &wgpu::Device,
+    label: &str,
+) -> Model {
+    let aspect = texture.texture.width() as f32 / texture.texture.height() as f32;
+    let vertices= vec![
+        ModelVertex {
+            position: [-0.5 * aspect, -0.5, 0.0],
+            tex_coords: [0.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
+        },
+        ModelVertex {
+            position: [-0.5 * aspect, 0.5, 0.0],
+            tex_coords: [0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+        },
+        ModelVertex {
+            position: [0.5 * aspect, 0.5, 0.0],
+            tex_coords: [1.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+        },
+        ModelVertex {
+            position: [0.5 * aspect, -0.5, 0.0],
+            tex_coords: [1.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
+        },
+    ];
+    let indices = vec![0, 1, 2, 2, 3, 0, /*padding*/ 0];
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("{:?} Vertex Buffer", label)),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("{:?} Index Buffer", label)),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
 
-    #[allow(unused)]
-    fn draw_model(&mut self, model: &'a Model, camera_bind_group: &'a wgpu::BindGroup);
-    fn draw_model_instanced(
-        &mut self,
-        model: &'a Model,
-        instances: Range<u32>,
-        camera_bind_group: &'a wgpu::BindGroup,
-    );
-}
+    let mesh = Mesh {
+        name: label.to_string(),
+        vertex_buffer,
+        index_buffer,
+        num_elements: indices.len() as u32,
+        material: 0,
+    };
 
-impl<'a, 'b> DrawModel<'b> for wgpu::RenderPass<'a>
-where
-    'b: 'a,
-{
-    fn draw_mesh(
-        &mut self,
-        mesh: &'b Mesh,
-        material: &'b Material,
-        camera_bind_group: &'b wgpu::BindGroup,
-    ) {
-        self.draw_mesh_instanced(mesh, material, 0..1, camera_bind_group);
-    }
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&texture.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&texture.sampler),
+            },
+        ],
+        label: Some(&format!("{:?} Bind Group", label)),
+    });
 
-    fn draw_mesh_instanced(
-        &mut self,
-        mesh: &'b Mesh,
-        material: &'b Material,
-        instances: Range<u32>,
-        camera_bind_group: &'b wgpu::BindGroup,
-    ) {
-        self.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-        self.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        self.set_bind_group(0, &material.bind_group, &[]);
-        self.set_bind_group(1, camera_bind_group, &[]);
-        self.draw_indexed(0..mesh.num_elements, 0, instances);
-    }
+    let material = Material {
+        name: label.to_string(),
+        diffuse_texture: texture,
+        bind_group,
+    };
 
-    fn draw_model(&mut self, model: &'b Model, camera_bind_group: &'b wgpu::BindGroup) {
-        self.draw_model_instanced(model, 0..1, camera_bind_group);
-    }
-
-    fn draw_model_instanced(
-        &mut self,
-        model: &'b Model,
-        instances: Range<u32>,
-        camera_bind_group: &'b wgpu::BindGroup,
-    ) {
-        for mesh in &model.meshes {
-            let material = &model.materials[mesh.material];
-            self.draw_mesh_instanced(mesh, material, instances.clone(), camera_bind_group);
-        }
+    Model {
+        meshes: vec![mesh],
+        materials: vec![material],
     }
 }

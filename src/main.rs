@@ -38,11 +38,10 @@ async fn main() -> Result<()> {
                 }
                 _ => ()    
             }
-            engine.input(&event);
         }
         //controller.update(&mut renderer.camera.camera_position);
-        engine.update();
-        engine.render()?;
+        engine.update()?;
+        engine.render(&[])?;
     }
 
     Ok(())

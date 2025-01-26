@@ -1,80 +1,31 @@
-use std::iter;
+use std::{iter, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use camera::{Camera, CameraController};
+use context::WgpuContext;
 use sdl2::{event, video::Window};
-use wgpu::util::DeviceExt;
+use instance::{Instance, InstanceManager, InstanceRaw};
+use draw::DrawModel;
 
 mod model;
 mod resources;
 mod texture;
 mod camera;
+pub mod instance;
+mod draw;
+mod context;
 
-use model::{DrawModel, Vertex};
+use model::{texture_to_model, Vertex};
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
 
-
-struct Instance {
-    position: ultraviolet::Vec3,
-    rotation: ultraviolet::Rotor3,
-}
-
-impl Instance {
+pub trait InstanceAble {
+    fn to_instance(&self) -> Instance;
     fn to_raw(&self) -> InstanceRaw {
-        InstanceRaw {
-            model: (ultraviolet::Mat4::from_translation(self.position)
-                * ultraviolet::Mat4::from_angle_plane(self.rotation.s, self.rotation.bv))
-            .into(),
-        }
+        self.to_instance().to_raw()
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct InstanceRaw {
-    #[allow(dead_code)]
-    model: [[f32; 4]; 4],
-}
-
-impl InstanceRaw {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        use std::mem;
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
-            // We need to switch from using a step mode of Vertex to Instance
-            // This means that our shaders will only change to use the next
-            // instance when the shader starts processing a new instance
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
-                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
-                // for each vec4. We don't have to do this in code though.
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 6,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 7,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
-                    shader_location: 8,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowSize {
@@ -82,100 +33,19 @@ pub struct WindowSize {
     pub height: u32,
 }
 
-pub struct WgpuEngine<'a> {
-    surface: wgpu::Surface<'a>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    size: WindowSize,
+pub struct WgpuEngine<'w> {
+    context: WgpuContext<'w>,
     render_pipeline: wgpu::RenderPipeline,
-    obj_model: model::Model,
     camera: Camera,
-    camera_controller: CameraController,
-    instances: Vec<Instance>,
-    #[allow(dead_code)]
-    instance_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
-    window: &'a Window,
 }
 
-impl<'a> WgpuEngine<'a> {
-    pub async fn new(window: &'a Window) -> Result<WgpuEngine<'a>> {
-        let size = WindowSize {
-            width: window.size().0,
-            height: window.size().1,
-        };
-
-        // The instance is a handle to our GPU
-        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
-        log::warn!("WGPU setup");
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
-            ..Default::default()
-        });
-
-        let surface = unsafe {
-            match instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(window).unwrap())
-            {
-                std::result::Result::Ok(s) => s,
-                Err(e) => return Err(anyhow!(e)),
-            }
-        };
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
-        log::warn!("device and queue");
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: wgpu::Features::empty(),
-                    // WebGL doesn't support all of wgpu's features, so if
-                    // we're building for the web we'll have to disable some.
-                    required_limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
-                    memory_hints: Default::default(),
-                },
-                // Some(&std::path::Path::new("trace")), // Trace path
-                None, // Trace path
-            )
-            .await
-            .unwrap();
-
-        log::warn!("Surface");
-        let surface_caps = surface.get_capabilities(&adapter);
-        // Shader code in this tutorial assumes an Srgb surface texture. Using a different
-        // one will result all the colors comming out darker. If you want to support non
-        // Srgb surfaces, you'll need to account for that when drawing to the frame.
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
+impl<'w> WgpuEngine<'w> {
+    pub async fn new(window: &'w Window) -> Result<WgpuEngine<'w>> {
+        let context = WgpuContext::new(window).await?;
 
         let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            context.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -198,7 +68,7 @@ impl<'a> WgpuEngine<'a> {
             });
 
         let camera_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        context.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
@@ -214,69 +84,61 @@ impl<'a> WgpuEngine<'a> {
 
         let camera = Camera::new(
             camera::LookAt::new((0.0, 3.0, 10.0).into(), (0.0, 0.0, 0.0).into(), (0.0, 1.0, 0.0).into()),
-            Box::new(camera::PerspectiveProjection::new(size.width as f32 / size.height as f32, 45.0, 0.1, 100.0)
+            Box::new(camera::PerspectiveProjection::new(context.size.width as f32 / context.size.height as f32, 45.0, 0.1, 100.0)
             ),
-            &device,
+            &context.device,
             &camera_bind_group_layout,
         );
-        let camera_controller = CameraController::new(0.05);
-
-        
-
-        const SPACE_BETWEEN: f32 = 3.0;
-        let instances = (0..NUM_INSTANCES_PER_ROW)
-            .flat_map(|z| {
-                (0..NUM_INSTANCES_PER_ROW).map(move |x| {
-                    let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
-                    let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
-
-                    let position = ultraviolet::Vec3 { x, y: 0.0, z };
-
-                    let rotation = if position.mag() == 0.0 {
-                        ultraviolet::Rotor3::identity()
-                    } else {
-                        ultraviolet::Rotor3::from_rotation_between(
-                            ultraviolet::Vec3::unit_z(),
-                            position.normalized(),
-                        )
-                    };
-
-                    Instance { position, rotation }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        
 
         log::warn!("Load model");
-        let obj_model =
-            resources::load_model("cube.obj", &device, &queue, &texture_bind_group_layout)
-                .await
-                .unwrap();
+        let obj_model = Arc::new(
+            texture_to_model(
+                resources::load_texture("cube-diffuse.jpg", &context.device, &context.queue).await?,
+                &texture_bind_group_layout,
+                &context.device,
+                "box",
+            ));
+        let mut instance_manager = instance::InstanceManager::new(&context.device, obj_model.clone()); 
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        const SPACE_BETWEEN: f32 = 3.0;
+        for i in 0..NUM_INSTANCES_PER_ROW {
+            for j in 0..NUM_INSTANCES_PER_ROW {
+                let x = SPACE_BETWEEN * (i as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                let z = SPACE_BETWEEN * (j as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+
+                let position = ultraviolet::Vec3 { x, y: 0.0, z };
+
+                let rotation = if position.mag() == 0.0 {
+                    ultraviolet::Rotor3::identity()
+                } else {
+                    ultraviolet::Rotor3::from_rotation_between(
+                        ultraviolet::Vec3::unit_z(),
+                        position.normalized(),
+                    )
+                };
+
+                let instance = Instance { position, rotation, id: (i * NUM_INSTANCES_PER_ROW + j) as u128 , scale: 1.0};
+                instance_manager.add_instance(&context.device, &context.queue, instance);
+            }
+        }
+
+
+        let shader = context.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shader.wgsl").into()),
         });
 
         let depth_texture =
-            texture::Texture::create_depth_texture(&device, &config, "depth_texture");
+            texture::Texture::create_depth_texture(&context.device, &context.config, "depth_texture");
 
         let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            context.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let render_pipeline = context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
@@ -289,7 +151,7 @@ impl<'a> WgpuEngine<'a> {
                 module: &shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: context.config.format,
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent::REPLACE,
                         alpha: wgpu::BlendComponent::REPLACE,
@@ -329,57 +191,45 @@ impl<'a> WgpuEngine<'a> {
             // Useful for optimizing shader compilation on Android
             cache: None,
         });
-        surface.configure(&device, &config);
+        context.surface.configure(&context.device, &context.config);
         Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
-            size,
+            context,
             render_pipeline,
-            obj_model,
             camera,
-            camera_controller,
-            instances,
-            instance_buffer,
             depth_texture,
-            window,
         })
     }
 
     pub fn window(&self) -> &Window {
-        &self.window
+        &self.context.window
     }
 
     pub fn resize(&mut self, new_size: WindowSize) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.size = new_size;
-            self.camera.projection.resize(self.config.width as f32, self.config.height as f32);
-            self.surface.configure(&self.device, &self.config);
+            self.context.config.width = new_size.width;
+            self.context.config.height = new_size.height;
+            self.context.size = new_size;
+            self.camera.projection.resize(self.context.config.width as f32, self.context.config.height as f32);
+            self.context.surface.configure(&self.context.device, &self.context.config);
             self.depth_texture =
-                texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
+                texture::Texture::create_depth_texture(&self.context.device, &self.context.config, "depth_texture");
         }
     }
-    pub fn input(&mut self, event: &event::Event) -> bool {
-        self.camera_controller.process_events(event)
-    }
 
-    pub fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
+    pub fn update(&mut self) -> Result<()> {
         log::info!("{:?}", self.camera);
-        self.camera.update(&self.queue);
+        self.camera.update(&self.context.queue);
+        Ok(())
     }
 
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+    pub fn render(&mut self, to_draw: &[InstanceManager]) -> Result<()> {
+        let output = self.context.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
-            .device
+            .context.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
@@ -412,16 +262,13 @@ impl<'a> WgpuEngine<'a> {
                 timestamp_writes: None,
             });
 
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw_model_instanced(
-                &self.obj_model,
-                0..self.instances.len() as u32,
-                &self.camera.bind_group(),
-            );
+            for i in to_draw {
+                render_pass.draw_instances(i, &self.camera.bind_group());
+            }
         }
 
-        self.queue.submit(iter::once(encoder.finish()));
+        self.context.queue.submit(iter::once(encoder.finish()));
         output.present();
 
         Ok(())

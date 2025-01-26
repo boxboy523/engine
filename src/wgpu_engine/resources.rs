@@ -3,7 +3,7 @@ use std::io::{BufReader, Cursor};
 use cfg_if::cfg_if;
 use wgpu::util::DeviceExt;
 
-use super::{model, texture};
+use super::{model::{self, texture_to_model}, texture};
 
 pub async fn load_string(file_name: &str) -> anyhow::Result<String> {
     cfg_if! {
@@ -51,6 +51,16 @@ pub async fn load_texture(
 ) -> anyhow::Result<texture::Texture> {
     let data = load_binary(file_name).await?;
     texture::Texture::from_bytes(device, queue, &data, file_name)
+}
+
+pub async fn load_sprite(
+    file_name: &str,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> anyhow::Result<model::Model> {
+    let texture = load_texture(file_name, device, queue).await?;
+    Ok(texture_to_model(texture, layout, device, file_name))
 }
 
 pub async fn load_model(
